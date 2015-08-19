@@ -351,11 +351,215 @@ find_synaptics (void)
 	return ret;
 }
 
+enum
+{
+	COLUMN_DEVICE_NAME,
+	COLUMN_DEVICE_XID,
+	N_DEVICE_COLUMNS
+};
+
+static gint
+mouse_settings_device_get_int_property (XDevice *device,
+                                        Atom     prop,
+                                        guint    offset,
+                                        gint    *horiz)
+{
+    Atom     type;
+    gint     format;
+    gulong   n_items, bytes_after;
+    guchar  *data;
+    gint     val = -1;
+    gint     res;
+
+    gdk_error_trap_push ();
+    res = XGetDeviceProperty (GDK_DISPLAY (), device, prop, 0, 1000, False,
+                              AnyPropertyType, &type, &format,
+                              &n_items, &bytes_after, &data);
+    if (gdk_error_trap_pop () == 0 && res == Success)
+    {
+        if (type == XA_INTEGER)
+        {
+            if (n_items > offset)
+                val = data[offset];
+
+            if (n_items > 1 + offset && horiz != NULL)
+                *horiz = data[offset + 1];
+        }
+
+        XFree (data);
+    }
+
+    return val;
+}
+
+static gboolean
+mouse_settings_device_get_selected (GtkBuilder  *dialog,
+                                    XDevice    **device)
+{
+	GtkTreeIter   iter;
+	gboolean      found = FALSE;
+	gulong        xid;
+	GtkTreeModel *model;
+
+	/* get the selected item */
+	found = gtk_combo_box_get_active_iter (GTK_COMBO_BOX (WID ("device-combobox")), &iter);
+	if (found)
+	{
+		/* get the device id  */
+		model = gtk_combo_box_get_model (GTK_COMBO_BOX (WID ("device-combobox")));
+		gtk_tree_model_get (model, &iter, COLUMN_DEVICE_XID, &xid, -1);
+
+		if (device != NULL)
+		{
+			/* open the device */
+			gdk_error_trap_push ();
+			*device = XOpenDevice (GDK_DISPLAY (), xid);
+			if (gdk_error_trap_pop () != 0 || *device == NULL)
+			{
+				g_critical ("Unable to open device %ld", xid);
+				*device = NULL;
+				found = FALSE;
+			}
+		}
+	}
+
+	return found;
+}
+
+static void
+mouse_settings_device_set_enabled (GtkToggleButton *button,
+                                   GtkBuilder      *dialog)
+{
+	XDevice  *device;
+	Atom      prop_enabled;
+	gboolean  enabled;
+
+	enabled = gtk_toggle_button_get_active (button);
+
+	if (mouse_settings_device_get_selected(dialog, &device)) {
+		prop_enabled = XInternAtom (GDK_DISPLAY_XDISPLAY(gdk_display_get_default()), "Device Enabled", False);
+
+		if (!prop_enabled)
+			return;
+
+		unsigned char data = enabled;
+		gdk_error_trap_push ();
+		XChangeDeviceProperty (GDK_DISPLAY_XDISPLAY(gdk_display_get_default()), device,
+		                       prop_enabled, XA_INTEGER, 8,
+		                       PropModeReplace, &data, 1);
+		gdk_flush ();
+		if (gdk_error_trap_pop ()) {
+			g_warning ("Error %s device.",
+			           (enabled) ? "enabling" : "disabling");
+		}
+
+		/* close the device */
+		XCloseDevice (GDK_DISPLAY (), device);
+	}
+}
+
+static void
+mouse_settings_device_selection_changed (GtkBuilder *dialog)
+{
+	XDevice   *device;
+	Atom       prop_enabled;
+	gint       is_enabled = -1;
+
+	if (mouse_settings_device_get_selected(dialog, &device)) {
+		prop_enabled = XInternAtom (GDK_DISPLAY_XDISPLAY(gdk_display_get_default()), "Device Enabled", False);
+
+		if (!prop_enabled)
+			return;
+
+		is_enabled = mouse_settings_device_get_int_property (device, prop_enabled, 0, NULL);
+
+		gtk_widget_set_sensitive (WID ("device-enabled"), is_enabled != -1);
+		gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (WID ("device-enabled")), is_enabled > 0);
+
+		/* close the device */
+		XCloseDevice (GDK_DISPLAY (), device);
+	}
+}
+
+static void
+mouse_settings_device_populate_store (GtkBuilder *dialog,
+                                      gboolean    create_store)
+{
+	XDeviceInfo     *device_list, *device_info;
+	gint             ndevices;
+	gint             i;
+	GtkTreeIter      iter;
+	GtkListStore    *store;
+	GtkCellRenderer *renderer;
+
+	/* create or get the store */
+	if (G_LIKELY (create_store))
+	{
+		store = gtk_list_store_new (N_DEVICE_COLUMNS,
+		                            G_TYPE_STRING /* COLUMN_DEVICE_NAME */,
+		                            G_TYPE_ULONG /* COLUMN_DEVICE_XID */);
+
+		gtk_combo_box_set_model (GTK_COMBO_BOX (WID ("device-combobox")), GTK_TREE_MODEL (store));
+
+		/* text renderer */
+		renderer = gtk_cell_renderer_text_new ();
+		gtk_cell_layout_pack_start (GTK_CELL_LAYOUT (WID ("device-combobox")), renderer, TRUE);
+		gtk_cell_layout_set_attributes (GTK_CELL_LAYOUT (WID ("device-combobox")), renderer,
+		                                "text", COLUMN_DEVICE_NAME, NULL);
+
+		g_signal_connect_swapped (G_OBJECT (WID ("device-combobox")), "changed",
+		                          G_CALLBACK (mouse_settings_device_selection_changed), dialog);
+	}
+	else
+	{
+		store = GTK_LIST_STORE (gtk_combo_box_get_model (GTK_COMBO_BOX (WID ("device-combobox"))));
+		gtk_list_store_clear (store);
+	}
+
+	/* get all the registered devices */
+	gdk_error_trap_push ();
+	device_list = XListInputDevices (GDK_DISPLAY (), &ndevices);
+	if (gdk_error_trap_pop () != 0 || device_list == NULL)
+	{
+		g_message ("No devices found");
+		return;
+	}
+
+	for (i = 0; i < ndevices; i++)
+	{
+		/* get the device */
+		device_info = &device_list[i];
+
+		/* filter out the pointer and virtual devices */
+		if (device_info->use != IsXExtensionPointer
+		    || g_str_has_prefix (device_info->name, "Virtual core XTEST"))
+			continue;
+
+		/* cannot go any further without device name */
+		if (device_info->name == NULL)
+			continue;
+
+		/* insert in the store */
+		gtk_list_store_insert_with_values (store, &iter, i,
+		                                   COLUMN_DEVICE_NAME, device_info->name,
+		                                   COLUMN_DEVICE_XID, device_info->id,
+		                                   -1);
+	}
+
+	XFreeDeviceList (device_list);
+
+	gtk_combo_box_set_active (GTK_COMBO_BOX (WID ("device-combobox")), 0);
+}
+
 /* Set up the property editors in the dialog. */
 static void
 setup_dialog (GtkBuilder *dialog)
 {
 	GtkRadioButton    *radio;
+
+	mouse_settings_device_populate_store(dialog, TRUE);
+	g_signal_connect (G_OBJECT (WID("device-enabled")), "toggled",
+	                  G_CALLBACK (mouse_settings_device_set_enabled), dialog);
 
 	/* Orientation radio buttons */
 	radio = GTK_RADIO_BUTTON (WID ("left_handed_radio"));
@@ -397,8 +601,10 @@ setup_dialog (GtkBuilder *dialog)
 		G_SETTINGS_BIND_DEFAULT);
 
 	/* Trackpad page */
-	if (find_synaptics () == FALSE)
+	if (find_synaptics () == FALSE) {
 		gtk_notebook_remove_page (GTK_NOTEBOOK (WID ("prefs_widget")), -1);
+		gtk_notebook_set_show_tabs (GTK_NOTEBOOK (WID ("prefs_widget")), FALSE);
+	}
 	else {
 		g_settings_bind (touchpad_settings, "disable-while-typing",
 			WID ("disable_w_typing_toggle"), "active",
